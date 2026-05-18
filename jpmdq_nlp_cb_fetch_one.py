@@ -1,22 +1,16 @@
 """
 Fetch helpers: list available groups, fetch one group/day → polars DataFrame.
 
-Public API is 100% synchronous. Internally uses asyncio.run() to keep the
-aiohttp session alive inside a single event loop (the SDK's _run_sync pattern
-creates a new loop per call, which closes the session between calls).
-
-Usage:
-    from jpmdq_nlp_cb_fetch_group import list_groups, fetch_group
-
-    groups = list_groups()                         # all groups visible to credentials
-    nlp    = list_groups(filter="nlp")             # filter by substring
-    df     = fetch_group("NLP_CB_STATEMENTS", "20240101")
+Public API is 100% synchronous. Uses nest_asyncio to patch the event loop so
+asyncio.run() works safely inside interactive Python, Jupyter, and scripts alike.
+Single aiohttp session is kept alive across all calls.
 """
 import asyncio
 import os
 from pathlib import Path
 
 import polars as pl
+import nest_asyncio
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -24,8 +18,31 @@ load_dotenv()
 from dataquery import DataQuery
 from dataquery.types.models import AttributesResponse, TimeSeriesResponse
 
-CLIENT_ID = os.environ["DATAQUERY_CLIENT_ID"]
-CLIENT_SECRET = os.environ["DATAQUERY_CLIENT_SECRET"]
+def _resolve_creds():
+    """Resolve JPMDQ credentials from environment, trying multiple naming conventions.
+
+    Returns (client_id, client_secret). Sets DATAQUERY_CLIENT_ID / DATAQUERY_CLIENT_SECRET
+    in os.environ so the underlying DataQuery SDK can pick them up too.
+    """
+    pairs = [
+        ('JPM_A_CLIENT_ID', 'JPM_A_CLIENT_SECRET'),
+        ('JPM_G_CLIENT_ID', 'JPM_G_CLIENT_SECRET'),
+        ('DATAQUERY_CLIENT_ID', 'DATAQUERY_CLIENT_SECRET'),
+        ('jpm_a_client_id', 'jpm_a_client_secret'),
+        ('jpm_g_client_id', 'jpm_g_client_secret'),
+    ]
+    for cid_key, sec_key in pairs:
+        cid_val = os.environ.get(cid_key)
+        sec_val = os.environ.get(sec_key)
+        if cid_val and sec_val:
+            os.environ.setdefault('DATAQUERY_CLIENT_ID', cid_val)
+            os.environ.setdefault('DATAQUERY_CLIENT_SECRET', sec_val)
+            return cid_val, sec_val
+    print("No JPMDQ credentials found: set JPM_A_CLIENT_ID/SECRET, DATAQUERY_CLIENT_ID/SECRET, etc.", flush=True)
+    raise SystemExit(1)
+
+CLIENT_ID, CLIENT_SECRET = _resolve_creds()
+nest_asyncio.apply()
 BASE_URL = os.environ.get("DATAQUERY_BASE_URL", "https://api-developer.jpmorgan.com")
 
 
@@ -143,11 +160,29 @@ def fetch_group(
     frequency: str = "FREQ_DAY",
     conversion: str = "CONV_LASTBUS_ABS",
     nan_treatment: str = "NA_NOTHING",
+    search_text: str | None = None,
 ) -> pl.DataFrame:
     """Fetch one group for one obs_date → polars DataFrame with columns instrument/attribute/date/value."""
     async def _inner():
         async with DataQuery(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, base_url=BASE_URL) as dq:
             client = dq._client
+
+            # --- search for matching instruments (optional) ---
+            search_ids: list[str] | None = None
+            if search_text:
+                try:
+                    search_resp = await client.search_instruments_async(
+                        group_id=group_id,
+                        keywords=search_text,
+                    )
+                    search_ids = []
+                    for inst in getattr(search_resp, "instruments", []) or []:
+                        iid = str(getattr(inst, "instrument_id", None) or getattr(inst, "instrument_name", None) or "")
+                        if iid:
+                            search_ids.append(iid)
+                    print(f"[search] {group_id} text='{search_text}' → {len(search_ids)} instrument(s)")
+                except Exception as exc:
+                    print(f"[warn] search_text failed: {exc}")
 
             # --- attribute discovery (with pagination) ---
             attrs: list[str] = []
@@ -195,6 +230,7 @@ def fetch_group(
                         frequency=frequency,
                         conversion=conversion,
                         nan_treatment=nan_treatment,
+                        **({"ids": search_ids} if search_ids else {}),
                     )
                 except Exception as exc:
                     print(f"[warn] chunk {chunk_idx + 1}/{len(attr_chunks)} failed: {exc}")
