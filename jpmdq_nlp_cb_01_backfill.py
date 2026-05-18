@@ -28,7 +28,7 @@ if str(_HERE) not in sys.path:
 
 from jpmdq_nlp_cb_utils import (
     auto_detect_catalog_schema, business_days, classify_failure,
-    copy_into_bronze, ensure_tables, ensure_volume, fetch_group_day,
+    copy_into_bronze, ensure_tables, ensure_volume, process_group_day,
     get_ingested_dates, get_spark, upsert_manifest, write_day_to_volume,
     yesterday_ymd,
 )
@@ -154,55 +154,29 @@ with DataQuery(**dq_kwargs) as dq:
 
             print(prefix, end=" → ", flush=True)
 
-            try:
-                rows = fetch_group_day(dq, group_id=group_id, obs_date=obs_date,
-                                       calendar=CALENDAR, frequency=FREQUENCY,
-                                       conversion=CONVERSION, nan_treatment=NAN_TREATMENT)
-            except Exception as exc:
-                msg = f"{type(exc).__name__}: {exc}"
-                print(msg, flush=True)
-                record = {"group_id": group_id, "obs_date": obs_date, "ok": False, "message": msg, "pass": 1}
-                misses.append(record)
-                miss_log.open("a").write(json.dumps(record) + "\n")
+            rec = process_group_day(
+                dq,
+                spark=spark,
+                dry_run=DRY_RUN,
+                volume_raw_path=volume_raw_path,
+                manifest_table=manifest_table,
+                group_id=group_id,
+                obs_date=obs_date,
+                download_ts=download_ts,
+                calendar=CALENDAR,
+                frequency=FREQUENCY,
+                conversion=CONVERSION,
+                nan_treatment=NAN_TREATMENT,
+            )
+            rec["pass"] = 1
+            if rec["ok"]:
+                print(("[dry-run] " if DRY_RUN else "") + rec["message"], flush=True)
+                successes.append(rec)
+            else:
+                print(rec["message"], flush=True)
+                misses.append(rec)
+                miss_log.open("a").write(json.dumps(rec) + "\n")
                 continue
-
-            if not rows:
-                msg = "empty_payload: 0 rows returned"
-                print(msg, flush=True)
-                misses.append({"group_id": group_id, "obs_date": obs_date, "ok": False, "message": msg, "pass": 1})
-                continue
-
-            row_count        = len(rows)
-            instrument_count = len({r["instrument"] for r in rows})
-            attribute_count  = len({r["attribute"] for r in rows})
-            msg = f"rows={row_count} instruments={instrument_count} attributes={attribute_count}"
-
-            if DRY_RUN:
-                print(f"[dry-run] {msg}", flush=True)
-                successes.append({"group_id": group_id, "obs_date": obs_date, "ok": True, "message": msg, "pass": 1})
-                continue
-
-            try:
-                vpath = write_day_to_volume(rows, volume_raw_path=volume_raw_path,
-                                            group_id=group_id, obs_date=obs_date, download_ts=download_ts)
-            except Exception as exc:
-                msg = f"volume_write_error: {type(exc).__name__}: {exc}"
-                print(msg, flush=True)
-                record = {"group_id": group_id, "obs_date": obs_date, "ok": False, "message": msg, "pass": 1}
-                misses.append(record)
-                miss_log.open("a").write(json.dumps(record) + "\n")
-                continue
-
-            try:
-                upsert_manifest(spark, manifest_table=manifest_table, group_id=group_id,
-                                obs_date=obs_date, row_count=row_count,
-                                instrument_count=instrument_count, attribute_count=attribute_count,
-                                status="ok", volume_path=vpath)
-            except Exception as exc:
-                print(f"  [warn] manifest update failed: {exc}", flush=True)
-
-            print(msg, flush=True)
-            successes.append({"group_id": group_id, "obs_date": obs_date, "ok": True, "message": msg, "pass": 1})
 
     # ---- diagnose-then-fix retries ----
     actionable = [m for m in misses if classify_failure(m["message"])["strategy"] != "skip"]
@@ -217,28 +191,21 @@ with DataQuery(**dq_kwargs) as dq:
                 if diag.get("wait_s", 0) > 0:
                     print(f"  [sleep {diag['wait_s']}s] {group_id} {obs_date} ({diag['category']})", flush=True)
                     time.sleep(diag["wait_s"])
-                try:
-                    rows = fetch_group_day(dq, group_id=group_id, obs_date=obs_date,
-                                           calendar=CALENDAR, frequency=FREQUENCY,
-                                           conversion=CONVERSION, nan_treatment=NAN_TREATMENT)
-                    ok  = bool(rows)
-                    msg = f"rows={len(rows)}" if rows else "empty_payload: 0 rows"
-                except Exception as exc:
-                    rows, ok, msg = [], False, f"{type(exc).__name__}: {exc}"
-
-                if ok and not DRY_RUN:
-                    vpath = write_day_to_volume(rows, volume_raw_path=volume_raw_path,
-                                                group_id=group_id, obs_date=obs_date, download_ts=download_ts)
-                    try:
-                        upsert_manifest(spark, manifest_table=manifest_table, group_id=group_id,
-                                        obs_date=obs_date, row_count=len(rows),
-                                        instrument_count=len({r["instrument"] for r in rows}),
-                                        attribute_count=len({r["attribute"] for r in rows}),
-                                        status="ok", volume_path=vpath)
-                    except Exception as exc:
-                        print(f"  [warn] manifest update failed: {exc}", flush=True)
-
-                rec = {**m, "pass": pass_num, "ok": ok, "message": msg}
+                rec = process_group_day(
+                    dq,
+                    spark=spark,
+                    dry_run=DRY_RUN,
+                    volume_raw_path=volume_raw_path,
+                    manifest_table=manifest_table,
+                    group_id=group_id,
+                    obs_date=obs_date,
+                    download_ts=download_ts,
+                    calendar=CALENDAR,
+                    frequency=FREQUENCY,
+                    conversion=CONVERSION,
+                    nan_treatment=NAN_TREATMENT,
+                )
+                rec = {**m, **rec, "pass": pass_num}
                 miss_log.open("a").write(json.dumps(rec) + "\n")
                 if ok:
                     successes.append(rec)

@@ -332,6 +332,85 @@ def classify_failure(message: str) -> dict:
     return {"category": "unknown", "strategy": "std_backoff", "wait_s": 30}
 
 
+def process_group_day(
+    dq: Any,
+    *,
+    spark: Any,
+    dry_run: bool,
+    volume_raw_path: str,
+    manifest_table: str,
+    group_id: str,
+    obs_date: str,
+    download_ts: str,
+    calendar: str = "CAL_USBANK",
+    frequency: str = "FREQ_DAY",
+    conversion: str = "CONV_LASTBUS_ABS",
+    nan_treatment: str = "NA_NOTHING",
+) -> dict:
+    try:
+        rows = fetch_group_day(
+            dq,
+            group_id=group_id,
+            obs_date=obs_date,
+            calendar=calendar,
+            frequency=frequency,
+            conversion=conversion,
+            nan_treatment=nan_treatment,
+        )
+    except Exception as exc:
+        return {"group_id": group_id, "obs_date": obs_date, "ok": False, "message": f"{type(exc).__name__}: {exc}"}
+
+    if not rows:
+        return {"group_id": group_id, "obs_date": obs_date, "ok": False, "message": "empty_payload: 0 rows returned"}
+
+    row_count = len(rows)
+    instrument_count = len({r["instrument"] for r in rows})
+    attribute_count = len({r["attribute"] for r in rows})
+    message = f"rows={row_count} instruments={instrument_count} attributes={attribute_count}"
+
+    record = {
+        "group_id": group_id,
+        "obs_date": obs_date,
+        "ok": True,
+        "message": message,
+        "row_count": row_count,
+        "instrument_count": instrument_count,
+        "attribute_count": attribute_count,
+    }
+
+    if dry_run:
+        return record
+
+    try:
+        vpath = write_day_to_volume(
+            rows,
+            volume_raw_path=volume_raw_path,
+            group_id=group_id,
+            obs_date=obs_date,
+            download_ts=download_ts,
+        )
+        record["volume_path"] = vpath
+    except Exception as exc:
+        return {"group_id": group_id, "obs_date": obs_date, "ok": False, "message": f"volume_write_error: {type(exc).__name__}: {exc}"}
+
+    try:
+        upsert_manifest(
+            spark,
+            manifest_table=manifest_table,
+            group_id=group_id,
+            obs_date=obs_date,
+            row_count=row_count,
+            instrument_count=instrument_count,
+            attribute_count=attribute_count,
+            status="ok",
+            volume_path=vpath,
+        )
+    except Exception as exc:
+        record["manifest_warning"] = str(exc)
+
+    return record
+
+
 # ---------------------------------------------------------------------------
 # Databricks helpers
 # ---------------------------------------------------------------------------

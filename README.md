@@ -37,28 +37,20 @@ On a Databricks cluster, store these as cluster environment variables or Databri
 ## Discover your NLP group IDs
 
 The exact group ID for "NLP Central Bank" varies by your access permissions.
-Run this snippet with your credentials to list available NLP groups:
+The project is now fully synchronous — no `asyncio` required.
+
+Use the built-in helper:
+
+```bash
+python jpmdq_nlp_cb_fetch_one.py
+```
+
+Or from Python:
 
 ```python
-import asyncio
-from dataquery import DataQuery
-import os
+from jpmdq_nlp_cb_fetch_one import list_groups
 
-async def list_nlp_groups():
-    async with DataQuery(
-        client_id=os.environ["DATAQUERY_CLIENT_ID"],
-        client_secret=os.environ["DATAQUERY_CLIENT_SECRET"],
-    ) as dq:
-        client = dq._client
-        cat = await client.get_groups_async()
-        nlp_groups = [
-            g.group_id for g in cat.groups
-            if any(k in g.group_id.upper() for k in ["NLP", "TEXT", "CBSPCH", "CBMIN", "CBSTAT"])
-        ]
-        for g in nlp_groups:
-            print(g)
-
-asyncio.run(list_nlp_groups())
+print(list_groups(filter="nlp"))
 ```
 
 ---
