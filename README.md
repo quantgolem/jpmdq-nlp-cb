@@ -9,6 +9,8 @@ Self-contained scripts to download **JPMDQ NLP Central Bank** group data day-by-
 | `jpmdq_nlp_cb_utils.py` | Shared helpers: JPMDQ fetch, parse, retry logic, Databricks session/table setup |
 | `jpmdq_nlp_cb_01_backfill.py` | **Full historical backfill** — downloads every business day in a date range |
 | `jpmdq_nlp_cb_02_incremental.py` | **Daily incremental** — auto-detects last ingested date and fetches only missing days |
+| `jpmdq_nlp_cb_fetch_one.py` | Helpers: `list_groups()` and `fetch_group(group_id, obs_date)` → polars DataFrame |
+| `jpmdq_macro_japan_cpi.py` | **Japan CPI macro fetcher** (DQ_ECON_PRICES). Four tiers: `fetch_headline_core()` (~15 series), `fetch_main_categories()` (10 MIAC categories), `fetch_subcategories()` (~85 curated middle/small groups), `fetch_all_items()` (~1,636 detailed items). Monthly data → `Data/jpm/downloads/jpmdq_macro/japan_cpi/<tier>__<date>.parquet`. |
 
 ## Prerequisites
 

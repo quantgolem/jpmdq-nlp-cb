@@ -23,6 +23,14 @@ load_dotenv()
 FETCH_TIMEOUT_SEC = int(os.environ.get("JPMDQ_FETCH_TIMEOUT_SEC", "300"))
 
 
+def resolve_jpmdq_credentials():
+    if "DATAQUERY_CLIENT_ID" in os.environ and "DATAQUERY_CLIENT_SECRET" in os.environ:
+        return os.environ["DATAQUERY_CLIENT_ID"], os.environ["DATAQUERY_CLIENT_SECRET"]
+    if "JPMDQ_CLIENT_ID" in os.environ and "JPMDQ_CLIENT_SECRET" in os.environ:
+        return os.environ["JPMDQ_CLIENT_ID"], os.environ["JPMDQ_CLIENT_SECRET"]
+    return None, None
+
+
 # ---------------------------------------------------------------------------
 # Date helpers
 # ---------------------------------------------------------------------------
