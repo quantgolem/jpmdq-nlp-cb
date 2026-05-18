@@ -1,10 +1,11 @@
 """
-Quick debug fetch: one group, one day → polars DataFrame.
+Debug helpers: list available groups, fetch one group/day → polars DataFrame.
 
 Usage:
-    from jpmdq_nlp_cb_fetch_one import fetch_one
-    df = fetch_one("NLP_CB_STATEMENTS", "20240101")
-    print(df)
+    from jpmdq_nlp_cb_fetch_one import list_groups, fetch_one
+
+    groups = list_groups()          # polars DataFrame: group_id, name, description
+    df     = fetch_one("NLP_CB_STATEMENTS", "20240101")
 """
 import os
 import polars as pl
@@ -12,6 +13,82 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from dataquery import DataQuery
+
+
+def list_groups(filter: str = "") -> pl.DataFrame:
+    """
+    Return all JPMDQ groups your credentials can see as a polars DataFrame.
+    Optionally filter by substring (case-insensitive) on group_id or name.
+
+    Columns: group_id, name, description
+    """
+    client_id     = os.environ["DATAQUERY_CLIENT_ID"]
+    client_secret = os.environ["DATAQUERY_CLIENT_SECRET"]
+    base_url      = os.environ.get("DATAQUERY_BASE_URL", "https://api-developer.jpmorgan.com")
+
+    rows  = []
+    seen  = set()
+
+    with DataQuery(client_id=client_id, client_secret=client_secret, base_url=base_url) as dq:
+        client = dq._client
+
+        try:
+            resp = client.get_groups()
+        except Exception as exc:
+            print(f"[error] get_groups failed: {exc}")
+            return pl.DataFrame()
+
+        def _harvest(resp_obj):
+            groups = (
+                getattr(resp_obj, "groups", None)
+                or getattr(resp_obj, "data",   None)
+                or (resp_obj if isinstance(resp_obj, list) else [])
+            )
+            for g in groups or []:
+                gid  = str(getattr(g, "group_id",    None) or getattr(g, "id",   "") or "")
+                name = str(getattr(g, "name",        None) or getattr(g, "label","") or "")
+                desc = str(getattr(g, "description", None) or "")
+                if gid and gid not in seen:
+                    seen.add(gid)
+                    rows.append({"group_id": gid, "name": name, "description": desc})
+
+        _harvest(resp)
+
+        # follow pagination
+        import requests
+        next_url = resp.get_next_link() if hasattr(resp, "get_next_link") else None
+        visited, count = set(), 0
+        while next_url and count < 200 and next_url not in visited:
+            visited.add(next_url)
+            count += 1
+            token = None
+            for attr in ("access_token", "_access_token", "token", "_token"):
+                token = getattr(client, attr, None)
+                if token:
+                    break
+            if not next_url.startswith("http"):
+                next_url = f"{base_url.rstrip('/')}/{next_url.lstrip('/')}"
+            try:
+                r = requests.get(next_url, headers={"Authorization": f"Bearer {token}"}, timeout=120)
+                r.raise_for_status()
+                payload = r.json()
+                _harvest(payload)
+                links    = payload.get("_links", {}) if isinstance(payload, dict) else {}
+                next_url = (links.get("next") or {}).get("href")
+            except Exception:
+                break
+
+    df = pl.DataFrame(rows) if rows else pl.DataFrame({"group_id": [], "name": [], "description": []})
+
+    if filter:
+        f = filter.lower()
+        df = df.filter(
+            pl.col("group_id").str.to_lowercase().str.contains(f)
+            | pl.col("name").str.to_lowercase().str.contains(f)
+        )
+
+    print(f"[list_groups] {len(df)} groups found" + (f" matching '{filter}'" if filter else ""))
+    return df
 
 
 def fetch_one(group_id: str, obs_date: str) -> pl.DataFrame:
