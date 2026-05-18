@@ -14,6 +14,7 @@ Usage:
 """
 import asyncio
 import os
+from pathlib import Path
 
 import polars as pl
 from dotenv import load_dotenv
@@ -89,7 +90,10 @@ def _parse_ts(resp_obj) -> list[dict]:
 
 
 def list_groups(filter: str = "") -> pl.DataFrame:
-    """Return all JPMDQ groups accessible to the credentials as a polars DataFrame.
+    """Return all 575 JPMDQ groups (e.g. FI_GO_BO_AA_AUD_GOV, FI_SW_*, DQ_ECON_*) as a polars DataFrame.
+
+    Reads from the catalog snapshot on disk when available (fast, no API call).
+    Falls back to the live API otherwise.
 
     Columns: group_id, name, description
 
@@ -97,33 +101,41 @@ def list_groups(filter: str = "") -> pl.DataFrame:
         filter: optional case-insensitive substring to match against group_id or name.
 
     Example:
-        all_groups = list_groups()
-        fi_groups  = list_groups(filter="FI_GO")
+        all_groups  = list_groups()
+        fi_go_only  = list_groups(filter="FI_GO")
+        swaps_only  = list_groups(filter="FI_SW")
     """
-    client_id, client_secret, base_url = _credentials()
+    CATALOG_PATH = Path("/home/workspace/Data/jpm/downloads/jpmdq/catalog/jpmdq_01a_catalog__latest.parquet")
 
-    async def _inner() -> list[dict]:
-        async with DataQuery(client_id=client_id, client_secret=client_secret, base_url=base_url) as dq:
-            client = dq._client
-            try:
-                groups = await client.list_groups_async()
-            except Exception as exc:
-                print(f"[error] list_groups_async failed: {exc}")
-                return []
+    if CATALOG_PATH.exists():
+        df = pl.read_parquet(CATALOG_PATH).select(
+            pl.col("group_id"),
+            pl.col("group_name").alias("name"),
+            pl.col("description"),
+        )
+    else:
+        client_id, client_secret, base_url = _credentials()
 
-            rows = []
-            seen: set[str] = set()
-            for g in groups or []:
-                gid = str(getattr(g, "group_id", None) or "")
-                name = str(getattr(g, "group_name", None) or "")
-                desc = str(getattr(g, "description", None) or "")
-                if gid and gid not in seen:
-                    seen.add(gid)
-                    rows.append({"group_id": gid, "name": name, "description": desc})
-            return rows
+        async def _inner() -> list[dict]:
+            async with DataQuery(client_id=client_id, client_secret=client_secret, base_url=base_url) as dq:
+                try:
+                    groups = await dq.list_groups_async(limit=None)
+                except Exception as exc:
+                    print(f"[error] list_groups_async failed: {exc}")
+                    return []
+                rows = []
+                seen: set[str] = set()
+                for g in groups or []:
+                    gid = str(getattr(g, "group_id", None) or "")
+                    name = str(getattr(g, "group_name", None) or "")
+                    desc = str(getattr(g, "description", None) or "")
+                    if gid and gid not in seen:
+                        seen.add(gid)
+                        rows.append({"group_id": gid, "name": name, "description": desc})
+                return rows
 
-    rows = asyncio.run(_inner())
-    df = pl.DataFrame(rows) if rows else pl.DataFrame({"group_id": [], "name": [], "description": []})
+        rows = asyncio.run(_inner())
+        df = pl.DataFrame(rows) if rows else pl.DataFrame({"group_id": [], "name": [], "description": []})
 
     if filter:
         f = filter.lower()
@@ -239,9 +251,9 @@ if __name__ == "__main__":
     all_groups = list_groups()
     print(all_groups)
 
-    # ── 2. Filter to economics groups ──────────────────────────────────────
-    econ_groups = list_groups(filter="DQ_ECON")
-    print(econ_groups)
+    # ── 2. Filter to government-bond groups ────────────────────────────────
+    fi_go_groups = list_groups(filter="FI_GO")
+    print(fi_go_groups)
 
     # ── 3. Fetch one govie group for one day ───────────────────────────────
     df = fetch_one("FI_GO_BO_AA_AUD_GOV", "20260515")
