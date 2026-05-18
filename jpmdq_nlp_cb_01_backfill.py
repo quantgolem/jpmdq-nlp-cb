@@ -2,34 +2,33 @@
 JPMDQ NLP Central Bank — Full Historical Backfill
 ==================================================
 Downloads NLP Central Bank group time-series data day-by-day from JPM DataQuery
-and saves it to Databricks Delta tables.
+and saves it to Databricks.
 
-Storage layout (Unity Catalog):
-  Bronze:   {catalog}.{schema}.jpmdq_nlp_cb_bronze    — one row per instrument/attribute/date
-  Manifest: {catalog}.{schema}.jpmdq_nlp_cb_manifest  — one row per (group, obs_date)
+Storage flow (two explicit steps):
+  1. Per (group, obs_date): write a parquet file to a Databricks Volume
+       /Volumes/{catalog}/{schema}/jpmdq_nlp_cb/raw/{group_id}/
+         jpmdq_nlp_cb__{group_id}__{obs_date}__{ts}.parquet
+  2. After all files are saved: COPY INTO the bronze Delta table
+       {catalog}.{schema}.jpmdq_nlp_cb_bronze
+     (COPY INTO auto-tracks loaded files — re-running is safe)
 
-Usage (run from work laptop or as a Databricks Job):
+The manifest Delta table ({catalog}.{schema}.jpmdq_nlp_cb_manifest) is updated
+after each successful Volume write, recording coverage for the incremental script.
+
+Usage:
 
   python jpmdq_nlp_cb_01_backfill.py \\
       --groups NLP_CB_STATEMENTS NLP_CB_MINUTES \\
       --start 20200101 \\
       --end 20261231 \\
-      [--catalog my_catalog] \\
-      [--schema my_schema]
+      [--catalog my_catalog --schema my_schema]
 
-Credentials:
-  Set env vars DATAQUERY_CLIENT_ID + DATAQUERY_CLIENT_SECRET  (or --client-id / --client-secret).
-  On a Databricks cluster you can store them as Databricks Secrets and pass via cluster env vars.
+Credentials (env vars or CLI flags):
+  DATAQUERY_CLIENT_ID + DATAQUERY_CLIENT_SECRET
+  On Databricks clusters: set as cluster environment variables.
 
 Dependencies:
-  pip install dataquery-sdk polars pandas databricks-connect databricks-sdk pyspark
-
-Discover available NLP groups:
-  Use jpmdq_nlp_cb_catalog.py (see README) or run:
-    from dataquery import DataQuery
-    async with DataQuery(...) as dq:
-        cat = await dq._client.get_groups_async()
-        nlp = [g.group_id for g in cat.groups if 'NLP' in g.group_id or 'TEXT' in g.group_id]
+  pip install dataquery-sdk polars databricks-connect databricks-sdk pyspark
 """
 from __future__ import annotations
 
@@ -42,31 +41,30 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Add parent dir to path if running from this directory (local dev)
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from jpmdq_nlp_cb_utils import (
-    FETCH_TIMEOUT_SEC,
     auto_detect_catalog_schema,
     business_days,
     classify_failure,
+    copy_into_bronze,
     ensure_tables,
+    ensure_volume,
     fetch_group_day,
-    get_dbutils,
     get_ingested_dates,
     get_spark,
-    write_day_to_delta,
+    upsert_manifest,
+    volume_file_path,
+    write_day_to_volume,
     yesterday_ymd,
 )
 
 try:
     from dataquery import DataQuery
 except ImportError as exc:
-    raise SystemExit(
-        "Missing dataquery-sdk. Install it: pip install dataquery-sdk"
-    ) from exc
+    raise SystemExit("Missing dataquery-sdk. Install: pip install dataquery-sdk") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -76,48 +74,39 @@ except ImportError as exc:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="jpmdq_nlp_cb_01_backfill.py",
-        description="Full historical backfill of JPMDQ NLP Central Bank groups into Databricks.",
+        description="Full historical backfill of JPMDQ NLP CB groups → Databricks Volume → Delta table.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument(
-        "--groups", nargs="+", required=True,
-        metavar="GROUP_ID",
-        help="One or more JPMDQ group IDs, e.g. NLP_CB_STATEMENTS NLP_CB_MINUTES",
-    )
+    p.add_argument("--groups", nargs="+", required=True, metavar="GROUP_ID",
+                   help="One or more JPMDQ group IDs, e.g. NLP_CB_STATEMENTS NLP_CB_MINUTES")
     p.add_argument("--start", required=True, help="Start date YYYYMMDD (inclusive)")
-    p.add_argument("--end", default=None,
-                   help="End date YYYYMMDD (inclusive). Defaults to yesterday.")
-    p.add_argument("--catalog", default="",
-                   help="Databricks Unity Catalog name. Auto-detected in GIC env if omitted.")
-    p.add_argument("--schema", default="",
-                   help="Databricks schema name. Auto-detected in GIC env if omitted.")
-    p.add_argument("--bronze-table", default="jpmdq_nlp_cb_bronze",
-                   help="Unqualified bronze table name (default: jpmdq_nlp_cb_bronze).")
-    p.add_argument("--manifest-table", default="jpmdq_nlp_cb_manifest",
-                   help="Unqualified manifest table name (default: jpmdq_nlp_cb_manifest).")
-    p.add_argument("--client-id", default="",
-                   help="JPMDQ OAuth client ID (or set DATAQUERY_CLIENT_ID env var).")
-    p.add_argument("--client-secret", default="",
-                   help="JPMDQ OAuth client secret (or set DATAQUERY_CLIENT_SECRET env var).")
-    p.add_argument("--oauth-aud", default="",
-                   help="JPMDQ OAuth audience URL (or set DATAQUERY_OAUTH_AUD env var).")
-    p.add_argument("--base-url", default="",
-                   help="JPMDQ API base URL (default: https://api-developer.jpmorgan.com).")
+    p.add_argument("--end", default=None, help="End date YYYYMMDD (inclusive). Default: yesterday.")
+    p.add_argument("--catalog", default="", help="Databricks Unity Catalog. Auto-detected in GIC env.")
+    p.add_argument("--schema", default="", help="Databricks schema. Auto-detected in GIC env.")
+    p.add_argument("--volume-name", default="jpmdq_nlp_cb",
+                   help="Volume name under the schema (default: jpmdq_nlp_cb).")
+    p.add_argument("--bronze-table", default="jpmdq_nlp_cb_bronze")
+    p.add_argument("--manifest-table", default="jpmdq_nlp_cb_manifest")
+    p.add_argument("--client-id", default="")
+    p.add_argument("--client-secret", default="")
+    p.add_argument("--oauth-aud", default="")
+    p.add_argument("--base-url", default="")
     p.add_argument("--calendar", default="CAL_USBANK")
     p.add_argument("--frequency", default="FREQ_DAY")
     p.add_argument("--conversion", default="CONV_LASTBUS_ABS")
     p.add_argument("--nan-treatment", default="NA_NOTHING")
     p.add_argument("--force", action="store_true",
-                   help="Re-download dates already in the manifest (overwrite).")
+                   help="Re-download dates already in manifest (overwrite).")
+    p.add_argument("--skip-copy-into", action="store_true",
+                   help="Write files to Volume only; skip the final COPY INTO step.")
     p.add_argument("--dry-run", action="store_true",
-                   help="Print what would be downloaded; do not write anything.")
-    p.add_argument("--log-dir", default="",
-                   help="Directory for JSON miss/summary logs. Defaults to ./logs.")
+                   help="Print what would be fetched; do not write anything.")
+    p.add_argument("--log-dir", default="logs")
     return p
 
 
 # ---------------------------------------------------------------------------
-# Core per-(group, day) fetch-then-write
+# Per-(group, day) fetch → Volume write
 # ---------------------------------------------------------------------------
 
 async def _try_one(
@@ -125,16 +114,20 @@ async def _try_one(
     *,
     group_id: str,
     obs_date: str,
+    volume_raw_path: str,
+    download_ts: str,
     spark,
-    bronze_table: str,
     manifest_table: str,
     calendar: str,
     frequency: str,
     conversion: str,
     nan_treatment: str,
     dry_run: bool,
-) -> tuple[bool, str]:
-    """Attempt one (group, obs_date) fetch-and-write. Returns (ok, message). Never raises."""
+) -> tuple[bool, str, str | None]:
+    """
+    Fetch one (group, obs_date), write parquet to Volume, update manifest.
+    Returns (ok, message, volume_path_or_None). Never raises.
+    """
     try:
         rows = await fetch_group_day(
             dq,
@@ -146,33 +139,49 @@ async def _try_one(
             nan_treatment=nan_treatment,
         )
     except Exception as exc:
-        return False, f"{type(exc).__name__}: {exc}"
+        return False, f"{type(exc).__name__}: {exc}", None
 
     if not rows:
-        return False, "empty_payload: 0 rows returned"
+        return False, "empty_payload: 0 rows returned", None
+
+    row_count = len(rows)
+    instrument_count = len({r["instrument"] for r in rows})
+    attribute_count = len({r["attribute"] for r in rows})
+    msg = f"rows={row_count} instruments={instrument_count} attributes={attribute_count}"
 
     if dry_run:
-        instr = len({r["instrument"] for r in rows})
-        attrs = len({r["attribute"] for r in rows})
-        return True, f"[dry-run] rows={len(rows)} instruments={instr} attributes={attrs}"
+        return True, f"[dry-run] {msg}", None
 
+    # Step 1: write parquet to Volume
     try:
-        result = write_day_to_delta(
-            spark,
+        vpath = write_day_to_volume(
             rows,
-            bronze_table=bronze_table,
-            manifest_table=manifest_table,
+            volume_raw_path=volume_raw_path,
             group_id=group_id,
             obs_date=obs_date,
+            download_ts=download_ts,
         )
     except Exception as exc:
-        return False, f"delta_write_error: {type(exc).__name__}: {exc}"
+        return False, f"volume_write_error: {type(exc).__name__}: {exc}", None
 
-    return True, (
-        f"rows={result['row_count']} "
-        f"instruments={result['instrument_count']} "
-        f"attributes={result['attribute_count']}"
-    )
+    # Update manifest (marks the file as saved; COPY INTO happens later in bulk)
+    if spark is not None:
+        try:
+            upsert_manifest(
+                spark,
+                manifest_table=manifest_table,
+                group_id=group_id,
+                obs_date=obs_date,
+                row_count=row_count,
+                instrument_count=instrument_count,
+                attribute_count=attribute_count,
+                status="ok",
+                volume_path=vpath,
+            )
+        except Exception as exc:
+            print(f"  [warn] manifest update failed: {exc}", flush=True)
+
+    return True, msg, vpath
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +191,7 @@ async def _try_one(
 async def main_async() -> None:
     args = build_parser().parse_args()
 
-    # --- Credentials ---
+    # Credentials
     client_id = (
         args.client_id
         or os.environ.get("DATAQUERY_CLIENT_ID")
@@ -198,16 +207,13 @@ async def main_async() -> None:
     if not client_id or not client_secret:
         raise SystemExit(
             "Missing DataQuery credentials.\n"
-            "Set DATAQUERY_CLIENT_ID + DATAQUERY_CLIENT_SECRET env vars, "
+            "Set DATAQUERY_CLIENT_ID + DATAQUERY_CLIENT_SECRET, "
             "or pass --client-id / --client-secret."
         )
     oauth_aud = args.oauth_aud or os.environ.get("DATAQUERY_OAUTH_AUD", "")
-    base_url = (
-        args.base_url
-        or os.environ.get("DATAQUERY_BASE_URL", "https://api-developer.jpmorgan.com")
-    )
+    base_url = args.base_url or os.environ.get("DATAQUERY_BASE_URL", "https://api-developer.jpmorgan.com")
 
-    # --- Databricks catalog / schema ---
+    # Catalog / schema
     catalog = args.catalog or os.environ.get("DATABRICKS_CATALOG", "")
     schema = args.schema or os.environ.get("DATABRICKS_SCHEMA", "")
     if not catalog or not schema:
@@ -215,38 +221,40 @@ async def main_async() -> None:
         catalog, schema = auto_detect_catalog_schema()
     if not catalog or not schema:
         raise SystemExit(
-            "Could not auto-detect Databricks catalog/schema.\n"
+            "Could not detect Databricks catalog/schema.\n"
             "Pass --catalog and --schema, or set DATABRICKS_CATALOG / DATABRICKS_SCHEMA."
         )
 
+    volume_raw_path = f"/Volumes/{catalog}/{schema}/{args.volume_name}/raw"
     bronze_table = f"{catalog}.{schema}.{args.bronze_table}"
     manifest_table = f"{catalog}.{schema}.{args.manifest_table}"
 
-    # --- Date range ---
     end_date = args.end or yesterday_ymd()
     days = business_days(args.start, end_date)
     if not days:
         raise SystemExit(f"No business days between {args.start} and {end_date}.")
 
-    # --- Logging ---
-    log_dir = Path(args.log_dir or "logs").resolve()
-    log_dir.mkdir(parents=True, exist_ok=True)
-    run_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    miss_log = log_dir / f"backfill_misses__{run_ts}.jsonl"
-
     total_pairs = len(args.groups) * len(days)
     print(
-        f"[backfill] groups={args.groups}  days={len(days)} ({args.start}→{end_date})\n"
-        f"[backfill] total_pairs={total_pairs}  bronze={bronze_table}  dry_run={args.dry_run}",
+        f"[backfill] groups={args.groups}\n"
+        f"[backfill] days={len(days)} ({args.start}→{end_date})  total_pairs={total_pairs}\n"
+        f"[backfill] volume={volume_raw_path}\n"
+        f"[backfill] bronze={bronze_table}  dry_run={args.dry_run}",
         flush=True,
     )
 
-    # --- Spark + tables ---
+    # Spark + tables + volume
     if not args.dry_run:
         spark = get_spark()
+        ensure_volume(catalog, schema, args.volume_name)
         ensure_tables(spark, bronze_table, manifest_table)
     else:
         spark = None
+
+    log_dir = Path(args.log_dir).resolve()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    download_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    miss_log = log_dir / f"backfill_misses__{download_ts}.jsonl"
 
     dq_kwargs: dict = {"client_id": client_id, "client_secret": client_secret, "base_url": base_url}
     if oauth_aud:
@@ -262,20 +270,21 @@ async def main_async() -> None:
                 done += 1
                 prefix = f"[{done}/{total_pairs}] {group_id} {obs_date}"
 
-                # Skip already-ingested dates (unless --force)
+                # Skip already-ingested dates
                 if not args.dry_run and not args.force:
                     already = get_ingested_dates(spark, manifest_table, group_id)
                     if obs_date in already:
-                        print(f"{prefix} → skip (already in manifest)", flush=True)
+                        print(f"{prefix} → skip (in manifest)", flush=True)
                         continue
 
                 print(prefix, end=" → ", flush=True)
-                ok, msg = await _try_one(
+                ok, msg, vpath = await _try_one(
                     dq,
                     group_id=group_id,
                     obs_date=obs_date,
+                    volume_raw_path=volume_raw_path,
+                    download_ts=download_ts,
                     spark=spark,
-                    bronze_table=bronze_table,
                     manifest_table=manifest_table,
                     calendar=args.calendar,
                     frequency=args.frequency,
@@ -291,28 +300,27 @@ async def main_async() -> None:
                     misses.append(record)
                     miss_log.open("a").write(json.dumps(record) + "\n")
 
-        # --- Pass 2 + 3: diagnose-then-fix retries for misses ---
-        actionable_misses = [m for m in misses if classify_failure(m["message"])["strategy"] != "skip"]
-        if actionable_misses:
-            print(f"\n[retry] retrying {len(actionable_misses)} actionable misses...", flush=True)
+        # Diagnose-then-fix retries
+        actionable = [m for m in misses if classify_failure(m["message"])["strategy"] != "skip"]
+        if actionable:
+            print(f"\n[retry] retrying {len(actionable)} actionable misses...", flush=True)
             still_failing: list[dict] = []
-            for m in actionable_misses:
+            for m in actionable:
                 group_id, obs_date = m["group_id"], m["obs_date"]
                 diag = classify_failure(m["message"])
                 resolved = False
-
                 for pass_num in (2, 3):
                     wait_s = diag.get("wait_s", 30)
                     if wait_s > 0:
                         print(f"  [sleep {wait_s}s] {group_id} {obs_date} ({diag['category']})", flush=True)
                         time.sleep(wait_s)
-
-                    ok, msg = await _try_one(
+                    ok, msg, vpath = await _try_one(
                         dq,
                         group_id=group_id,
                         obs_date=obs_date,
+                        volume_raw_path=volume_raw_path,
+                        download_ts=download_ts,
                         spark=spark,
-                        bronze_table=bronze_table,
                         manifest_table=manifest_table,
                         calendar=args.calendar,
                         frequency=args.frequency,
@@ -320,7 +328,7 @@ async def main_async() -> None:
                         nan_treatment=args.nan_treatment,
                         dry_run=args.dry_run,
                     )
-                    rec = {**m, "pass": pass_num, "ok": ok, "message": msg, "retry_category": diag["category"]}
+                    rec = {**m, "pass": pass_num, "ok": ok, "message": msg}
                     miss_log.open("a").write(json.dumps(rec) + "\n")
                     if ok:
                         successes.append(rec)
@@ -330,37 +338,36 @@ async def main_async() -> None:
                     diag = classify_failure(msg)
                     if diag["strategy"] == "skip":
                         break
-
                 if not resolved:
                     still_failing.append({**m, "pass": 3, "ok": False})
                     print(f"  [still-miss] {group_id} {obs_date}", flush=True)
-
             misses = still_failing
 
-    # --- Summary ---
+    # Step 2: COPY INTO Delta table from Volume (after all files are written)
+    if not args.dry_run and not args.skip_copy_into and successes:
+        print(f"\n[copy-into] loading {len(successes)} new files into {bronze_table}...", flush=True)
+        copy_into_bronze(spark, bronze_table, volume_raw_path)
+
+    # Summary
     skipped_empty = sum(1 for m in misses if classify_failure(m["message"])["strategy"] == "skip")
     summary = {
-        "run_ts": run_ts,
+        "run_ts": download_ts,
         "groups": args.groups,
         "date_range": f"{args.start}→{end_date}",
         "total_pairs": total_pairs,
         "successes": len(successes),
         "misses_actionable": len(misses) - skipped_empty,
         "misses_empty_payload": skipped_empty,
-        "dry_run": args.dry_run,
+        "volume_raw_path": volume_raw_path,
         "bronze_table": bronze_table,
         "manifest_table": manifest_table,
+        "dry_run": args.dry_run,
     }
-    summary_path = log_dir / f"backfill_summary__{run_ts}.json"
+    summary_path = log_dir / f"backfill_summary__{download_ts}.json"
     summary_path.write_text(json.dumps(summary, indent=2))
     print(f"\n[summary]\n{json.dumps(summary, indent=2)}", flush=True)
-    print(f"[logs] {log_dir}", flush=True)
-
     if misses:
-        print(
-            f"\n[warn] {len(misses) - skipped_empty} unrecovered miss(es). See: {miss_log}",
-            flush=True,
-        )
+        print(f"[warn] {len(misses) - skipped_empty} unrecovered miss(es). See: {miss_log}", flush=True)
 
 
 if __name__ == "__main__":

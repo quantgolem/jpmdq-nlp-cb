@@ -63,12 +63,29 @@ asyncio.run(list_nlp_groups())
 
 ---
 
-## Storage layout (Unity Catalog)
+## Storage flow (two explicit steps)
 
-The scripts create two Delta tables automatically:
+```
+JPMDQ API
+    │
+    ▼  (1) write_day_to_volume()
+/Volumes/{catalog}/{schema}/jpmdq_nlp_cb/raw/{group_id}/
+    jpmdq_nlp_cb__{group_id}__{obs_date}__{ts}.parquet
+    │
+    ▼  (2) COPY INTO  (auto-tracks loaded files — idempotent)
+{catalog}.{schema}.jpmdq_nlp_cb_bronze   ← Delta table
+```
 
-### Bronze table: `{catalog}.{schema}.jpmdq_nlp_cb_bronze`
-One row per instrument × attribute × date. The `value` column is STRING to handle both numeric scores and text-based NLP outputs.
+The Volume files are the raw source of truth. The Delta table is derived and can always be rebuilt with `COPY INTO`. The manifest Delta table is updated after each Volume write so the incremental script can detect the last ingested date.
+
+### Volume: `/Volumes/{catalog}/{schema}/jpmdq_nlp_cb/raw/`
+One parquet file per (group × obs_date). Naming convention:
+```
+jpmdq_nlp_cb__{GROUP_ID}__{YYYYMMDD}__{YYYYMMDDTHHMMSS}.parquet
+```
+
+### Bronze Delta table: `{catalog}.{schema}.jpmdq_nlp_cb_bronze`
+One row per instrument × attribute × date. `value` is STRING to handle both numeric scores and NLP text outputs.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -80,19 +97,20 @@ One row per instrument × attribute × date. The `value` column is STRING to han
 | `obs_date` | DATE | Business day fetched from JPMDQ |
 | `ingested_at` | TIMESTAMP | UTC timestamp of ingestion |
 
-Partitioned by `(group_id, obs_date)` for efficient incremental deletes.
+Partitioned by `(group_id, obs_date)`.
 
-### Manifest table: `{catalog}.{schema}.jpmdq_nlp_cb_manifest`
-One row per (group, obs_date). Used by the incremental script to detect the last ingested date.
+### Manifest Delta table: `{catalog}.{schema}.jpmdq_nlp_cb_manifest`
+One row per (group, obs_date). Drives incremental date detection.
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `group_id` | STRING | JPMDQ group identifier |
 | `obs_date` | DATE | Business day |
-| `row_count` | LONG | Rows written |
+| `row_count` | LONG | Rows in the parquet file |
 | `instrument_count` | LONG | Distinct instruments |
 | `attribute_count` | LONG | Distinct attributes |
 | `status` | STRING | `ok` or `empty` |
+| `volume_path` | STRING | Full path to the parquet file |
 | `ingested_at` | TIMESTAMP | UTC timestamp |
 
 ---

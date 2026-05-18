@@ -3,13 +3,21 @@ Shared utilities for JPMDQ NLP Central Bank group ingestion.
 
 Embedded self-contained helpers — no dependency on local project packages.
 Derived from jpmorgan-dataquery-assets/utils/group_returns.py patterns.
+
+Storage flow:
+  1. Fetch from JPMDQ  →  rows (list of dicts)
+  2. Write parquet to Databricks Volume  (raw bronze, one file per group × day)
+  3. COPY INTO Delta table  (idempotent; auto-tracks loaded files)
 """
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
+import tempfile
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any, Sequence
 
 
@@ -32,6 +40,11 @@ def business_days(start: str, end: str) -> list[str]:
 
 def yesterday_ymd() -> str:
     return (datetime.utcnow() - timedelta(days=1)).strftime("%Y%m%d")
+
+
+def ymd_to_iso(ymd: str) -> str:
+    """YYYYMMDD → YYYY-MM-DD."""
+    return f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}"
 
 
 # ---------------------------------------------------------------------------
@@ -70,8 +83,7 @@ def ts_to_rows(
 ) -> list[dict]:
     """
     Convert a DataQuery TimeSeriesResponse to a flat list of dicts.
-
-    value is kept as str (handles both numeric and NLP text attributes).
+    value is kept as str (handles numeric scores and NLP text attributes).
     """
     now = ingested_at or datetime.utcnow().isoformat()
     rows: list[dict] = []
@@ -186,8 +198,9 @@ async def discover_group_attributes(dq: Any, group_id: str) -> list[str]:
 
 def _is_no_content(exc: Exception) -> bool:
     s = str(exc).lower()
-    return "no content" in s or "'204'" in s or "code': '204'" in s or (
-        "field required" in s and "instruments" in s
+    return (
+        "no content" in s or "'204'" in s or "code': '204'" in s
+        or ("field required" in s and "instruments" in s)
     )
 
 
@@ -205,7 +218,7 @@ async def _fetch_one_call(
     obs_date: str,
     ingested_at: str,
 ) -> list[dict]:
-    """Paginated fetch for a single (group, day) call."""
+    """Paginated fetch for a single (group, day) call. Returns flat row list."""
     client = getattr(dq, "_client", dq)
     try:
         first = await asyncio.wait_for(
@@ -268,14 +281,14 @@ async def fetch_group_day(
     Fetch one (group, day) pair. Returns flat list of row dicts.
 
     Strategy:
-    1. Discover attributes.
+    1. Discover attributes for the group.
     2. Try full-attribute call.
-    3. If 0 rows, fall back to per-attribute-chunk calls.
+    3. If 0 rows returned, fall back to per-attribute-chunk calls.
     """
     ingested_at = datetime.utcnow().isoformat()
     attrs = await discover_group_attributes(dq, group_id)
     if not attrs:
-        print(f"  [warn] no attributes discovered for {group_id}; trying empty attribute list", flush=True)
+        print(f"  [warn] no attributes discovered for {group_id}; trying empty list", flush=True)
 
     common_kwargs = dict(
         group_id=group_id,
@@ -299,7 +312,7 @@ async def fetch_group_day(
     print(f"  [empty-full] {group_id} {obs_date}: full-attrs returned 0 rows, chunking", flush=True)
     all_rows: list[dict] = []
     for i in range(0, len(attrs), chunk_size):
-        chunk = attrs[i:i + chunk_size]
+        chunk = attrs[i : i + chunk_size]
         try:
             chunk_rows = await _fetch_one_call(dq, attributes=chunk, **common_kwargs)
             all_rows.extend(chunk_rows)
@@ -313,7 +326,6 @@ async def fetch_group_day(
 # ---------------------------------------------------------------------------
 
 def classify_failure(message: str) -> dict:
-    """Classify a failure message and return retry strategy."""
     s = (message or "").lower()
     if "429" in s or "rate limit" in s or "too many requests" in s or "quota" in s:
         return {"category": "rate_limit", "strategy": "long_backoff", "wait_s": 180}
@@ -329,7 +341,7 @@ def classify_failure(message: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Databricks session + table helpers
+# Databricks helpers
 # ---------------------------------------------------------------------------
 
 def get_spark():
@@ -350,19 +362,11 @@ def get_spark():
     return SparkSession.builder.appName("jpmdq_nlp_cb").getOrCreate()
 
 
-def get_dbutils(spark):
-    """Return dbutils if on a Databricks notebook/job; else None."""
-    try:
-        from pyspark.dbutils import DBUtils
-        return DBUtils(spark)
-    except Exception:
-        return None
-
-
 def auto_detect_catalog_schema() -> tuple[str, str]:
     """
     Auto-detect GIC Unity Catalog / personal schema via WorkspaceClient.
-    Returns ("", "") if not in GIC environment or sdk not installed.
+    Looks for a catalog containing 'users_schema_iz' (GIC Databricks convention).
+    Returns ('', '') if not in GIC environment.
     """
     try:
         from databricks.sdk import WorkspaceClient
@@ -377,6 +381,61 @@ def auto_detect_catalog_schema() -> tuple[str, str]:
         pass
     return "", ""
 
+
+# ---------------------------------------------------------------------------
+# Volume write  (step 1 of 2)
+# ---------------------------------------------------------------------------
+
+FILE_PREFIX = "jpmdq_nlp_cb"
+
+
+def volume_file_path(volume_raw_path: str, group_id: str, obs_date: str, download_ts: str) -> str:
+    """Return the full Volume path for one (group, obs_date) parquet file."""
+    filename = f"{FILE_PREFIX}__{group_id}__{obs_date}__{download_ts}.parquet"
+    return f"{volume_raw_path.rstrip('/')}/{group_id}/{filename}"
+
+
+def write_day_to_volume(
+    rows: list[dict],
+    *,
+    volume_raw_path: str,
+    group_id: str,
+    obs_date: str,
+    download_ts: str,
+) -> str:
+    """
+    Serialise one (group, obs_date) batch to a parquet file and upload it to a
+    Databricks Volume via the Files API (databricks-sdk).
+
+    Works both locally (databricks-connect) and on a Databricks cluster.
+    Returns the full Volume path of the written file.
+    """
+    import polars as pl
+    from databricks.sdk import WorkspaceClient
+
+    dest_path = volume_file_path(volume_raw_path, group_id, obs_date, download_ts)
+
+    df = (
+        pl.DataFrame(rows)
+        .with_columns([
+            pl.col("date").str.strptime(pl.Date, "%Y-%m-%d", strict=False),
+            pl.col("obs_date").str.strptime(pl.Date, "%Y-%m-%d", strict=False),
+            pl.col("ingested_at").str.to_datetime(strict=False),
+        ])
+    )
+
+    buf = io.BytesIO()
+    df.write_parquet(buf)
+    buf.seek(0)
+
+    w = WorkspaceClient()
+    w.files.upload(dest_path, buf, overwrite=True)
+    return dest_path
+
+
+# ---------------------------------------------------------------------------
+# Delta table setup + COPY INTO  (step 2 of 2)
+# ---------------------------------------------------------------------------
 
 BRONZE_DDL = """
 CREATE TABLE IF NOT EXISTS {table} (
@@ -401,6 +460,7 @@ CREATE TABLE IF NOT EXISTS {table} (
   instrument_count LONG,
   attribute_count  LONG,
   status           STRING,
+  volume_path      STRING,
   ingested_at      TIMESTAMP
 )
 USING DELTA
@@ -408,88 +468,98 @@ USING DELTA
 
 
 def ensure_tables(spark, bronze_table: str, manifest_table: str) -> None:
-    """CREATE TABLE IF NOT EXISTS for bronze and manifest tables."""
     spark.sql(BRONZE_DDL.format(table=bronze_table))
     spark.sql(MANIFEST_DDL.format(table=manifest_table))
     print(f"[tables] bronze={bronze_table}  manifest={manifest_table}", flush=True)
 
 
-def write_day_to_delta(
+def ensure_volume(catalog: str, schema: str, volume_name: str) -> None:
+    """Create the Databricks Volume if it does not already exist."""
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.service.catalog import VolumeType
+
+    w = WorkspaceClient()
+    try:
+        w.volumes.create(
+            catalog_name=catalog,
+            schema_name=schema,
+            name=volume_name,
+            volume_type=VolumeType.MANAGED,
+        )
+        print(f"[volume] created /Volumes/{catalog}/{schema}/{volume_name}", flush=True)
+    except Exception as exc:
+        if "already exists" in str(exc).lower():
+            pass  # fine
+        else:
+            print(f"[volume] could not create (may already exist): {exc}", flush=True)
+
+
+def copy_into_bronze(spark, bronze_table: str, volume_raw_path: str) -> None:
+    """
+    Load all parquet files from volume_raw_path into the bronze Delta table.
+
+    COPY INTO auto-tracks which files have already been loaded, so this is
+    fully idempotent — re-running only picks up new files.
+    """
+    spark.sql(f"""
+        COPY INTO {bronze_table}
+        FROM (
+          SELECT
+            CAST(group_id    AS STRING)    AS group_id,
+            CAST(instrument  AS STRING)    AS instrument,
+            CAST(attribute   AS STRING)    AS attribute,
+            CAST(date        AS DATE)      AS date,
+            CAST(value       AS STRING)    AS value,
+            CAST(obs_date    AS DATE)      AS obs_date,
+            CAST(ingested_at AS TIMESTAMP) AS ingested_at
+          FROM '{volume_raw_path}'
+        )
+        FILEFORMAT = PARQUET
+        COPY_OPTIONS ('recursiveFileLookup' = 'true', 'mergeSchema' = 'true')
+    """)
+    print(f"[copy-into] loaded new files from {volume_raw_path} → {bronze_table}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Manifest helpers
+# ---------------------------------------------------------------------------
+
+def upsert_manifest(
     spark,
-    rows: list[dict],
     *,
-    bronze_table: str,
     manifest_table: str,
     group_id: str,
     obs_date: str,
-) -> dict:
-    """
-    Idempotently write one (group, obs_date) batch to the bronze Delta table
-    and update the manifest.
-
-    Pattern: DELETE existing rows for (group_id, obs_date), then INSERT.
-    """
-    from pyspark.sql import Row
-    import pyspark.sql.functions as F
-
-    # DELETE existing rows for idempotency
-    spark.sql(
-        f"DELETE FROM {bronze_table} "
-        f"WHERE group_id = '{group_id}' AND obs_date = CAST('{obs_date[:4]}-{obs_date[4:6]}-{obs_date[6:]}' AS DATE)"
-    )
-
-    result = {"group_id": group_id, "obs_date": obs_date, "row_count": 0,
-              "instrument_count": 0, "attribute_count": 0, "status": "empty"}
-
-    if rows:
-        df_pd = _rows_to_pandas(rows)
-        sdf = spark.createDataFrame(df_pd)
-        sdf = (
-            sdf
-            .withColumn("date", F.to_date("date"))
-            .withColumn("obs_date", F.to_date("obs_date"))
-            .withColumn("ingested_at", F.to_timestamp("ingested_at"))
-        )
-        sdf.write.mode("append").saveAsTable(bronze_table)
-
-        row_count = len(rows)
-        instrument_count = len({r["instrument"] for r in rows})
-        attribute_count = len({r["attribute"] for r in rows})
-        result.update({
-            "row_count": row_count,
-            "instrument_count": instrument_count,
-            "attribute_count": attribute_count,
-            "status": "ok",
-        })
-
-    # Upsert manifest
+    row_count: int,
+    instrument_count: int,
+    attribute_count: int,
+    status: str,
+    volume_path: str,
+) -> None:
+    """Idempotent manifest upsert: delete existing row then insert."""
+    iso_date = ymd_to_iso(obs_date)
     ingested_at = datetime.utcnow().isoformat()
-    obs_date_fmt = f"{obs_date[:4]}-{obs_date[4:6]}-{obs_date[6:]}"
+
     spark.sql(
         f"DELETE FROM {manifest_table} "
-        f"WHERE group_id = '{group_id}' AND obs_date = CAST('{obs_date_fmt}' AS DATE)"
+        f"WHERE group_id = '{group_id}' AND obs_date = CAST('{iso_date}' AS DATE)"
     )
-    manifest_row = spark.createDataFrame([{
+    spark.createDataFrame([{
         "group_id": group_id,
-        "obs_date": obs_date_fmt,
-        "row_count": result["row_count"],
-        "instrument_count": result["instrument_count"],
-        "attribute_count": result["attribute_count"],
-        "status": result["status"],
+        "obs_date": iso_date,
+        "row_count": row_count,
+        "instrument_count": instrument_count,
+        "attribute_count": attribute_count,
+        "status": status,
+        "volume_path": volume_path,
         "ingested_at": ingested_at,
-    }])
-    import pyspark.sql.functions as F
-    manifest_row = (
-        manifest_row
-        .withColumn("obs_date", F.to_date("obs_date"))
-        .withColumn("ingested_at", F.to_timestamp("ingested_at"))
-    )
-    manifest_row.write.mode("append").saveAsTable(manifest_table)
-    return result
+    }]).withColumn("obs_date", __import__("pyspark.sql.functions", fromlist=["to_date"]).to_date("obs_date")
+    ).withColumn("ingested_at", __import__("pyspark.sql.functions", fromlist=["to_timestamp"]).to_timestamp("ingested_at")
+    ).write.mode("append").saveAsTable(manifest_table)
 
 
 def get_ingested_dates(spark, manifest_table: str, group_id: str) -> set[str]:
-    """Return set of YYYYMMDD dates already ingested (status=ok) for a group."""
+    """Return set of YYYYMMDD dates already successfully ingested for a group."""
     try:
         rows = spark.sql(
             f"SELECT obs_date FROM {manifest_table} "
@@ -501,7 +571,7 @@ def get_ingested_dates(spark, manifest_table: str, group_id: str) -> set[str]:
 
 
 def get_last_ingested_date(spark, manifest_table: str, group_id: str) -> str | None:
-    """Return max(obs_date) as YYYYMMDD for a group, or None if no data."""
+    """Return max(obs_date) as YYYYMMDD for a group, or None."""
     try:
         row = spark.sql(
             f"SELECT MAX(obs_date) AS max_date FROM {manifest_table} "
@@ -512,16 +582,3 @@ def get_last_ingested_date(spark, manifest_table: str, group_id: str) -> str | N
     except Exception:
         pass
     return None
-
-
-# ---------------------------------------------------------------------------
-# Minimal pandas bridge (avoids polars dependency)
-# ---------------------------------------------------------------------------
-
-def _rows_to_pandas(rows: list[dict]):
-    """Convert list of row dicts to a pandas DataFrame."""
-    try:
-        import pandas as pd
-        return pd.DataFrame(rows)
-    except ImportError:
-        raise ImportError("pandas is required: pip install pandas")
