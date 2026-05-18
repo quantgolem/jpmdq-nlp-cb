@@ -161,3 +161,19 @@ def fetch_one(group_id: str, obs_date: str) -> pl.DataFrame:
 
     print(f"[fetch_one] {len(rows)} rows")
     return pl.DataFrame(rows)
+
+
+if __name__ == "__main__":
+    # ── 1. List all groups your credentials can see ─────────────────────────
+    all_groups = list_groups()
+    print(all_groups)
+
+    # ── 2. Filter to NLP-related groups only ────────────────────────────────
+    nlp_groups = list_groups(filter="nlp")
+    print(nlp_groups)
+
+    # ── 3. Fetch one group for one day → inspect the DataFrame ──────────────
+    # Replace with the exact group_id you found in step 2
+    df = fetch_one("NLP_CB_STATEMENTS", "20240101")
+    print(df)
+    print(df.schema)

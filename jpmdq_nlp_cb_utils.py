@@ -551,3 +551,42 @@ def get_last_ingested_date(spark, manifest_table: str, group_id: str) -> str | N
     except Exception:
         pass
     return None
+
+
+if __name__ == "__main__":
+    # ── 1. business_days ────────────────────────────────────────────────────
+    days = business_days("20240101", "20240110")
+    print("business_days:", days)
+
+    # ── 2. classify_failure ─────────────────────────────────────────────────
+    for msg in ["429 too many requests", "401 unauthorized", "204 no content",
+                "connection timed out", "unknown error xyz"]:
+        print(f"  classify({msg!r}): {classify_failure(msg)}")
+
+    # ── 3. ts_to_rows — no live connection needed ───────────────────────────
+    class _Pt:
+        def __init__(self, d, v): self.date = d; self.value = v
+    class _Attr:
+        def __init__(self): self.attribute_id = "SENTIMENT"; self.time_series = [{"date": "2024-01-02", "value": "0.45"}]
+    class _Inst:
+        def __init__(self): self.instrument_name = "ECB"; self.attributes = [_Attr()]
+    class _TS:
+        def __init__(self): self.instruments = [_Inst()]
+
+    rows = ts_to_rows(_TS(), group_id="NLP_CB_STATEMENTS", obs_date="20240102")
+    print("ts_to_rows sample:", rows)
+
+    # ── 4. Live fetch_group_day (needs .env with DATAQUERY_* vars) ───────────
+    try:
+        from dataquery import DataQuery
+        client_id     = os.environ["DATAQUERY_CLIENT_ID"]
+        client_secret = os.environ["DATAQUERY_CLIENT_SECRET"]
+        base_url      = os.environ.get("DATAQUERY_BASE_URL", "https://api-developer.jpmorgan.com")
+        with DataQuery(client_id=client_id, client_secret=client_secret, base_url=base_url) as dq:
+            rows = fetch_group_day(dq, group_id="NLP_CB_STATEMENTS", obs_date="20240102")
+            print(f"fetch_group_day: {len(rows)} rows")
+            if rows:
+                import polars as pl
+                print(pl.DataFrame(rows).head(5))
+    except Exception as exc:
+        print(f"[live test skipped] {exc}")
