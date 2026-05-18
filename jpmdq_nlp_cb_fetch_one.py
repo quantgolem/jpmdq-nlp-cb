@@ -24,19 +24,9 @@ load_dotenv()
 from dataquery import DataQuery
 from dataquery.types.models import AttributesResponse, TimeSeriesResponse
 
-
-def _credentials() -> tuple[str, str, str]:
-    """Resolve JPMDQ credentials from environment."""
-    for id_key, sec_key in [
-        ("DATAQUERY_CLIENT_ID", "DATAQUERY_CLIENT_SECRET"),
-        ("JPM_A_CLIENT_ID", "JPM_A_CLIENT_SECRET"),
-        ("jpm_a_client_id", "jpm_a_client_secret"),
-    ]:
-        cid = os.environ.get(id_key)
-        csec = os.environ.get(sec_key)
-        if cid and csec:
-            return cid, csec, os.environ.get("DATAQUERY_BASE_URL", "https://api-developer.jpmorgan.com")
-    raise SystemExit("No JPMDQ credentials found. Set JPM_A_CLIENT_ID / JPM_A_CLIENT_SECRET.")
+CLIENT_ID = os.environ["DATAQUERY_CLIENT_ID"]
+CLIENT_SECRET = os.environ["DATAQUERY_CLIENT_SECRET"]
+BASE_URL = os.environ.get("DATAQUERY_BASE_URL", "https://api-developer.jpmorgan.com")
 
 
 def _parse_attrs(resp_obj) -> list[str]:
@@ -114,10 +104,8 @@ def list_groups(filter: str = "") -> pl.DataFrame:
             pl.col("description"),
         )
     else:
-        client_id, client_secret, base_url = _credentials()
-
         async def _inner() -> list[dict]:
-            async with DataQuery(client_id=client_id, client_secret=client_secret, base_url=base_url) as dq:
+            async with DataQuery(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, base_url=BASE_URL) as dq:
                 try:
                     groups = await dq.list_groups_async(limit=None)
                 except Exception as exc:
@@ -157,10 +145,8 @@ def fetch_group(
     nan_treatment: str = "NA_NOTHING",
 ) -> pl.DataFrame:
     """Fetch one group for one obs_date → polars DataFrame with columns instrument/attribute/date/value."""
-    client_id, client_secret, base_url = _credentials()
-
     async def _inner():
-        async with DataQuery(client_id=client_id, client_secret=client_secret, base_url=base_url) as dq:
+        async with DataQuery(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, base_url=BASE_URL) as dq:
             client = dq._client
 
             # --- attribute discovery (with pagination) ---
