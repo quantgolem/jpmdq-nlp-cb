@@ -7,13 +7,11 @@ Safe to run daily as a Databricks Job or scheduled script.
 For each group:
   1. Read max(obs_date) from manifest (status='ok').
   2. Fetch every business day from (last_date + 1) to --end (default: yesterday).
-  3. Write each parquet file to the Databricks Volume:
-       /Volumes/{catalog}/{schema}/jpmdq_nlp_cb/raw/{group_id}/
+  3. Write each parquet file to the Databricks Volume.
   4. Update the manifest Delta table after each successful file write.
   5. Run COPY INTO at the end — picks up only the new files (idempotent).
 
 Usage:
-
   python jpmdq_nlp_cb_02_incremental.py \\
       --groups NLP_CB_STATEMENTS NLP_CB_MINUTES \\
       [--end 20261231]           \\
@@ -21,23 +19,24 @@ Usage:
       [--catalog my_catalog]     \\
       [--schema my_schema]
 
-  If a group has no data in the manifest yet, --default-start is used
-  (default: 2 years before --end).
+Credentials loaded from .env (DATAQUERY_CLIENT_ID, DATAQUERY_CLIENT_SECRET,
+DATABRICKS_HOST, DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET).
 
-Credentials:
-  Set DATAQUERY_CLIENT_ID + DATAQUERY_CLIENT_SECRET env vars,
-  or use Databricks cluster environment variables.
+Dependencies:
+  pip install dataquery-sdk polars databricks-connect databricks-sdk pyspark python-dotenv requests
 """
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from dotenv import load_dotenv
+load_dotenv()
 
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
@@ -64,10 +63,6 @@ except ImportError as exc:
     raise SystemExit("Missing dataquery-sdk. Install: pip install dataquery-sdk") from exc
 
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="jpmdq_nlp_cb_02_incremental.py",
@@ -75,10 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--groups", nargs="+", required=True, metavar="GROUP_ID")
-    p.add_argument("--end", default=None,
-                   help="End date YYYYMMDD (inclusive). Default: yesterday.")
-    p.add_argument("--default-start", default=None,
-                   help="Start date for groups with no manifest data yet. Default: 2 years ago.")
+    p.add_argument("--end", default=None, help="End date YYYYMMDD (inclusive). Default: yesterday.")
+    p.add_argument("--default-start", default=None, help="Start for groups with no manifest data. Default: 2 years ago.")
     p.add_argument("--catalog", default="")
     p.add_argument("--schema", default="")
     p.add_argument("--volume-name", default="jpmdq_nlp_cb")
@@ -92,18 +85,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--frequency", default="FREQ_DAY")
     p.add_argument("--conversion", default="CONV_LASTBUS_ABS")
     p.add_argument("--nan-treatment", default="NA_NOTHING")
-    p.add_argument("--skip-copy-into", action="store_true",
-                   help="Write files to Volume only; skip the COPY INTO step.")
+    p.add_argument("--skip-copy-into", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--log-dir", default="logs")
     return p
 
 
-# ---------------------------------------------------------------------------
-# Per-(group, day) fetch → Volume write
-# ---------------------------------------------------------------------------
-
-async def _try_one(
+def fetch_and_write_day(
     dq,
     *,
     group_id: str,
@@ -119,7 +107,7 @@ async def _try_one(
     dry_run: bool,
 ) -> tuple[bool, str]:
     try:
-        rows = await fetch_group_day(
+        rows = fetch_group_day(
             dq,
             group_id=group_id,
             obs_date=obs_date,
@@ -142,7 +130,6 @@ async def _try_one(
     if dry_run:
         return True, f"[dry-run] {msg}"
 
-    # Write to Volume
     try:
         vpath = write_day_to_volume(
             rows,
@@ -154,7 +141,6 @@ async def _try_one(
     except Exception as exc:
         return False, f"volume_write_error: {type(exc).__name__}: {exc}"
 
-    # Update manifest
     if spark is not None:
         try:
             upsert_manifest(
@@ -174,14 +160,9 @@ async def _try_one(
     return True, msg
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-async def main_async() -> None:
+def run_incremental() -> None:
     args = build_parser().parse_args()
 
-    # Credentials
     client_id = (
         args.client_id
         or os.environ.get("DATAQUERY_CLIENT_ID")
@@ -197,12 +178,12 @@ async def main_async() -> None:
     if not client_id or not client_secret:
         raise SystemExit(
             "Missing DataQuery credentials.\n"
-            "Set DATAQUERY_CLIENT_ID + DATAQUERY_CLIENT_SECRET env vars."
+            "Set DATAQUERY_CLIENT_ID + DATAQUERY_CLIENT_SECRET in .env or environment."
         )
+
     oauth_aud = args.oauth_aud or os.environ.get("DATAQUERY_OAUTH_AUD", "")
     base_url = args.base_url or os.environ.get("DATAQUERY_BASE_URL", "https://api-developer.jpmorgan.com")
 
-    # Catalog / schema
     catalog = args.catalog or os.environ.get("DATABRICKS_CATALOG", "")
     schema = args.schema or os.environ.get("DATABRICKS_SCHEMA", "")
     if not catalog or not schema:
@@ -222,7 +203,6 @@ async def main_async() -> None:
     two_years_ago = (datetime.utcnow() - timedelta(days=730)).strftime("%Y%m%d")
     default_start = args.default_start or two_years_ago
 
-    # Spark + tables + volume
     if not args.dry_run:
         spark = get_spark()
         ensure_volume(catalog, schema, args.volume_name)
@@ -230,7 +210,6 @@ async def main_async() -> None:
     else:
         spark = None
 
-    # Per-group date ranges
     group_ranges: dict[str, list[str]] = {}
     for group_id in args.groups:
         last = None if args.dry_run else get_last_ingested_date(spark, manifest_table, group_id)
@@ -271,7 +250,7 @@ async def main_async() -> None:
     successes: list[dict] = []
     misses: list[dict] = []
 
-    async with DataQuery(**dq_kwargs) as dq:
+    with DataQuery(**dq_kwargs) as dq:
         done = 0
         for group_id, days in group_ranges.items():
             for obs_date in days:
@@ -279,7 +258,7 @@ async def main_async() -> None:
                 prefix = f"[{done}/{total_pairs}] {group_id} {obs_date}"
                 print(prefix, end=" → ", flush=True)
 
-                ok, msg = await _try_one(
+                ok, msg = fetch_and_write_day(
                     dq,
                     group_id=group_id,
                     obs_date=obs_date,
@@ -314,7 +293,7 @@ async def main_async() -> None:
                     wait_s = diag.get("wait_s", 30)
                     if wait_s > 0:
                         time.sleep(wait_s)
-                    ok, msg = await _try_one(
+                    ok, msg = fetch_and_write_day(
                         dq,
                         group_id=group_id,
                         obs_date=obs_date,
@@ -343,12 +322,10 @@ async def main_async() -> None:
                     print(f"  [still-miss] {group_id} {obs_date}", flush=True)
             misses = still_failing
 
-    # COPY INTO — picks up only new files (idempotent)
     if not args.dry_run and not args.skip_copy_into and successes:
         print(f"\n[copy-into] loading new files into {bronze_table}...", flush=True)
         copy_into_bronze(spark, bronze_table, volume_raw_path)
 
-    # Summary
     skipped_empty = sum(1 for m in misses if classify_failure(m["message"])["strategy"] == "skip")
     summary = {
         "run_ts": download_ts,
@@ -373,4 +350,4 @@ async def main_async() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main_async())
+    run_incremental()

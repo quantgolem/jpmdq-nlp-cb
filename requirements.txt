@@ -9,3 +9,7 @@ pandas>=2.0
 databricks-connect>=14.0
 databricks-sdk>=0.20
 pyspark>=3.5
+
+# Utilities
+python-dotenv>=1.0
+requests>=2.31
