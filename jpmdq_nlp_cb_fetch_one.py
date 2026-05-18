@@ -6,11 +6,11 @@ aiohttp session alive inside a single event loop (the SDK's _run_sync pattern
 creates a new loop per call, which closes the session between calls).
 
 Usage:
-    from jpmdq_nlp_cb_fetch_one import list_groups, fetch_one
+    from jpmdq_nlp_cb_fetch_group import list_groups, fetch_group
 
     groups = list_groups()                         # all groups visible to credentials
     nlp    = list_groups(filter="nlp")             # filter by substring
-    df     = fetch_one("NLP_CB_STATEMENTS", "20240101")
+    df     = fetch_group("NLP_CB_STATEMENTS", "20240101")
 """
 import asyncio
 import os
@@ -148,7 +148,7 @@ def list_groups(filter: str = "") -> pl.DataFrame:
     return df
 
 
-def fetch_one(
+def fetch_group(
     group_id: str,
     obs_date: str,
     calendar: str = "CAL_USBANK",
@@ -188,7 +188,7 @@ def fetch_one(
             except Exception as exc:
                 print(f"[warn] attribute discovery failed: {exc}")
 
-            print(f"[fetch_one] {group_id} {obs_date}  attrs={len(attrs)}")
+            print(f"[fetch_group] {group_id} {obs_date}  attrs={len(attrs)}")
             if not attrs:
                 print("[error] no attributes discovered — cannot fetch time series")
                 return []
@@ -237,10 +237,10 @@ def fetch_one(
 
     rows = asyncio.run(_inner())
     if not rows:
-        print("[fetch_one] no data returned")
+        print("[fetch_group] no data returned")
         return pl.DataFrame()
 
-    print(f"[fetch_one] {len(rows)} rows")
+    print(f"[fetch_group] {len(rows)} rows")
     return pl.DataFrame(rows)
 
 
@@ -254,6 +254,6 @@ if __name__ == "__main__":
     print(fi_go_groups)
 
     # ── 3. Fetch one govie group for one day ───────────────────────────────
-    df = fetch_one("FI_GO_BO_AA_AUD_GOV", "20260515")
+    df = fetch_group("FI_GO_BO_AA_AUD_GOV", "20260515")
     print(df)
     print(f"\nshape: {df.shape}  —  {df['instrument'].n_unique()} instruments × {df['attribute'].n_unique()} attributes")
