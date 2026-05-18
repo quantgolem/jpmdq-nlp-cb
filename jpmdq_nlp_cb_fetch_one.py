@@ -175,10 +175,9 @@ def fetch_one(
                     if next_url in visited:
                         break
                     visited.add(next_url)
-                    if not next_url.startswith("http"):
-                        next_url = f"{base_url.rstrip('/')}/{next_url.lstrip('/')}"
+                    absolute = next_url if next_url.startswith("http") else client._build_api_url(next_url.lstrip("/"))
                     try:
-                        async with await client._enter_request_cm("GET", next_url) as r:
+                        async with await client._enter_request_cm("GET", absolute) as r:
                             await client._handle_response(r)
                             payload = await r.json()
                         page = AttributesResponse(**payload)
@@ -223,10 +222,9 @@ def fetch_one(
                     if next_url in visited:
                         break
                     visited.add(next_url)
-                    if not next_url.startswith("http"):
-                        next_url = f"{base_url.rstrip('/')}/{next_url.lstrip('/')}"
+                    absolute = next_url if next_url.startswith("http") else client._build_api_url(next_url.lstrip("/"))
                     try:
-                        async with await client._enter_request_cm("GET", next_url) as r:
+                        async with await client._enter_request_cm("GET", absolute) as r:
                             await client._handle_response(r)
                             payload = await r.json()
                         page = TimeSeriesResponse(**payload)
