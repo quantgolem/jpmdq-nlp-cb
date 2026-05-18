@@ -89,55 +89,38 @@ def _parse_ts(resp_obj) -> list[dict]:
 
 
 def list_groups(filter: str = "") -> pl.DataFrame:
-    """Return all JPMDQ groups as a polars DataFrame. Optionally filter by substring."""
+    """Return all JPMDQ groups accessible to the credentials as a polars DataFrame.
+
+    Columns: group_id, name, description
+
+    Args:
+        filter: optional case-insensitive substring to match against group_id or name.
+
+    Example:
+        all_groups = list_groups()
+        fi_groups  = list_groups(filter="FI_GO")
+    """
     client_id, client_secret, base_url = _credentials()
 
-    async def _inner():
-        rows: list[dict] = []
-        seen: set[str] = set()
-
+    async def _inner() -> list[dict]:
         async with DataQuery(client_id=client_id, client_secret=client_secret, base_url=base_url) as dq:
             client = dq._client
             try:
-                resp = await client.list_groups_async()
+                groups = await client.list_groups_async()
             except Exception as exc:
-                print(f"[error] list_groups failed: {exc}")
-                return rows
+                print(f"[error] list_groups_async failed: {exc}")
+                return []
 
-            def _harvest(obj):
-                groups = (
-                    getattr(obj, "groups", None)
-                    or getattr(obj, "data", None)
-                    or (obj if isinstance(obj, list) else [])
-                )
-                for g in groups or []:
-                    gid = str(getattr(g, "group_id", None) or getattr(g, "id", "") or "")
-                    name = str(getattr(g, "name", None) or getattr(g, "label", "") or "")
-                    desc = str(getattr(g, "description", None) or "")
-                    if gid and gid not in seen:
-                        seen.add(gid)
-                        rows.append({"group_id": gid, "name": name, "description": desc})
-
-            _harvest(resp)
-
-            next_url = resp.get_next_link() if hasattr(resp, "get_next_link") else None
-            visited, count = set(), 0
-            while next_url and count < 200 and next_url not in visited:
-                visited.add(next_url)
-                count += 1
-                if not next_url.startswith("http"):
-                    next_url = f"{base_url.rstrip('/')}/{next_url.lstrip('/')}"
-                try:
-                    async with await client._enter_request_cm("GET", next_url) as r:
-                        await client._handle_response(r)
-                        payload = await r.json()
-                    _harvest(payload)
-                    links = payload.get("_links", {}) if isinstance(payload, dict) else {}
-                    next_url = (links.get("next") or {}).get("href")
-                except Exception:
-                    break
-
-        return rows
+            rows = []
+            seen: set[str] = set()
+            for g in groups or []:
+                gid = str(getattr(g, "group_id", None) or "")
+                name = str(getattr(g, "group_name", None) or "")
+                desc = str(getattr(g, "description", None) or "")
+                if gid and gid not in seen:
+                    seen.add(gid)
+                    rows.append({"group_id": gid, "name": name, "description": desc})
+            return rows
 
     rows = asyncio.run(_inner())
     df = pl.DataFrame(rows) if rows else pl.DataFrame({"group_id": [], "name": [], "description": []})
@@ -149,7 +132,7 @@ def list_groups(filter: str = "") -> pl.DataFrame:
             | pl.col("name").str.to_lowercase().str.contains(f)
         )
 
-    print(f"[list_groups] {len(df)} groups found" + (f" matching '{filter}'" if filter else ""))
+    print(f"[list_groups] {len(df)} groups" + (f" matching '{filter}'" if filter else ""))
     return df
 
 
@@ -252,6 +235,15 @@ def fetch_one(
 
 
 if __name__ == "__main__":
+    # ── 1. All accessible groups ────────────────────────────────────────────
+    all_groups = list_groups()
+    print(all_groups)
+
+    # ── 2. Filter to economics groups ──────────────────────────────────────
+    econ_groups = list_groups(filter="DQ_ECON")
+    print(econ_groups)
+
+    # ── 3. Fetch one govie group for one day ───────────────────────────────
     df = fetch_one("FI_GO_BO_AA_AUD_GOV", "20260515")
     print(df)
-    print(df.schema)
+    print(f"\nshape: {df.shape}  —  {df['instrument'].n_unique()} instruments × {df['attribute'].n_unique()} attributes")
