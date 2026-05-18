@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.env
+
+# Data files — never committed
+*.parquet
+*.csv
+*.duckdb
+*.feather
+*.ipc
+*.arrow
+*.jsonl
+*.xlsx
+
+# Data directories
+downloads/
+outputs/
+data/
+Data/
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

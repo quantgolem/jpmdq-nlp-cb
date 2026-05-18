@@ -1,0 +1,11 @@
+# Core JPMDQ SDK (JPM internal distribution)
+dataquery-sdk
+
+# Data handling
+polars>=0.20
+pandas>=2.0
+
+# Databricks
+databricks-connect>=14.0
+databricks-sdk>=0.20
+pyspark>=3.5
