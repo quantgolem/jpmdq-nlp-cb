@@ -15,6 +15,15 @@ load_dotenv()
 from dataquery import DataQuery
 
 
+def resolve_jpmdq_credentials():
+    """Check for credentials in order: DATAQUERY_CLIENT_ID/SECRET, then jpm_a_client_id/secret."""
+    if "DATAQUERY_CLIENT_ID" in os.environ and "DATAQUERY_CLIENT_SECRET" in os.environ:
+        return os.environ["DATAQUERY_CLIENT_ID"], os.environ["DATAQUERY_CLIENT_SECRET"]
+    if "jpm_a_client_id" in os.environ and "jpm_a_client_secret" in os.environ:
+        return os.environ["jpm_a_client_id"], os.environ["jpm_a_client_secret"]
+    raise SystemExit("No JPMDQ credentials found: DATAQUERY_CLIENT_ID/SECRET or jpm_a_client_id/secret")
+
+
 def list_groups(filter: str = "") -> pl.DataFrame:
     """
     Return all JPMDQ groups your credentials can see as a polars DataFrame.
@@ -22,8 +31,7 @@ def list_groups(filter: str = "") -> pl.DataFrame:
 
     Columns: group_id, name, description
     """
-    client_id     = os.environ["DATAQUERY_CLIENT_ID"]
-    client_secret = os.environ["DATAQUERY_CLIENT_SECRET"]
+    client_id, client_secret = resolve_jpmdq_credentials()
     base_url      = os.environ.get("DATAQUERY_BASE_URL", "https://api-developer.jpmorgan.com")
 
     rows  = []
@@ -92,8 +100,7 @@ def list_groups(filter: str = "") -> pl.DataFrame:
 
 
 def fetch_one(group_id: str, obs_date: str) -> pl.DataFrame:
-    client_id     = os.environ["DATAQUERY_CLIENT_ID"]
-    client_secret = os.environ["DATAQUERY_CLIENT_SECRET"]
+    client_id, client_secret = resolve_jpmdq_credentials()
     base_url      = os.environ.get("DATAQUERY_BASE_URL", "https://api-developer.jpmorgan.com")
 
     with DataQuery(client_id=client_id, client_secret=client_secret, base_url=base_url) as dq:
