@@ -171,7 +171,7 @@ python jpmdq_nlp_cb_02_incremental.py \
 
 ## Retry logic
 
-Both scripts use a **diagnose-then-fix** 3-pass retry strategy per [JPMDQ learnings](https://github.com/rorozozo-ai/knowledge-base):
+Both scripts use a **diagnose-then-fix** 3-pass retry strategy per [JPMDQ learnings](https://github.com/quantgolem/knowledge-base):
 
 | Signal | Category | Action |
 |--------|----------|--------|

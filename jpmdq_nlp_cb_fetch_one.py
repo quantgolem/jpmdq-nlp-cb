@@ -230,7 +230,7 @@ def fetch_group(
                         frequency=frequency,
                         conversion=conversion,
                         nan_treatment=nan_treatment,
-                        **({"ids": search_ids} if search_ids else {}),
+                        **({"filter": search_ids} if search_ids else {}),
                     )
                 except Exception as exc:
                     print(f"[warn] chunk {chunk_idx + 1}/{len(attr_chunks)} failed: {exc}")
